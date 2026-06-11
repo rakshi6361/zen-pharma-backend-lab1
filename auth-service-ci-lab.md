@@ -77,22 +77,105 @@ Confirm the student's repo appears in the `sub` list. GitHub Actions will assume
 
 ## Instructor Cluster Setup
 
-Run these steps once on the EKS cluster before students start. All commands are run from the `zen-infra` directory cloned on your laptop.
+Run these steps once on the EKS cluster before students start. All commands are manual — no scripts required.
 
 ### Step 1 — Install cluster prerequisites
 
 Installs NGINX Ingress, ArgoCD, External Secrets Operator, and metrics-server via Helm.
 
+Requires `kubectl`, `helm`, and the AWS CLI on your laptop.
+
+#### 1.1 — Configure kubectl
+
 ```bash
-cd zen-infra
-./scripts/01-install-prerequisites.sh
+export CLUSTER_NAME=pharma-dev-cluster
+export AWS_REGION=us-east-1
+
+aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+kubectl config current-context
+kubectl get nodes
 ```
 
-Prompts for:
-- EKS cluster name: `pharma-dev-cluster`
-- AWS region: `us-east-1`
+#### 1.2 — Add Helm repositories
 
-Save the ArgoCD admin password printed at the end — you'll need it for the UI.
+```bash
+helm repo add ingress-nginx    https://kubernetes.github.io/ingress-nginx --force-update
+helm repo add external-secrets https://charts.external-secrets.io         --force-update
+helm repo add argo             https://argoproj.github.io/argo-helm       --force-update
+helm repo add metrics-server   https://kubernetes-sigs.github.io/metrics-server/ --force-update
+helm repo update
+```
+
+#### 1.3 — Install NGINX Ingress Controller
+
+Creates an AWS Network Load Balancer that routes external HTTP/S traffic into the cluster.
+
+```bash
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.service.type=LoadBalancer \
+  --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"="nlb" \
+  --set controller.replicaCount=2 \
+  --wait --timeout 5m
+
+kubectl get svc -n ingress-nginx ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{"\n"}'
+```
+
+Save the NLB hostname printed above — it is the application entry point.
+
+#### 1.4 — Install ArgoCD
+
+```bash
+helm upgrade --install argocd argo/argo-cd \
+  --namespace argocd \
+  --create-namespace \
+  --wait --timeout 10m
+
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d && echo
+```
+
+Save the ArgoCD admin password printed above — you'll need it for the UI.
+
+- Username: `admin`
+- UI access (port-forward): `kubectl port-forward svc/argocd-server -n argocd 8080:443` → open `https://localhost:8080`
+
+#### 1.5 — Install External Secrets Operator
+
+```bash
+helm upgrade --install external-secrets external-secrets/external-secrets \
+  --namespace external-secrets \
+  --create-namespace \
+  --set installCRDs=true \
+  --wait --timeout 5m
+```
+
+#### 1.6 — Install metrics-server
+
+Required for HPA and `kubectl top pods/nodes`.
+
+```bash
+helm upgrade --install metrics-server metrics-server/metrics-server \
+  --namespace kube-system \
+  --set args="{--kubelet-insecure-tls}" \
+  --wait --timeout 5m
+```
+
+#### 1.7 — Verify installation
+
+```bash
+kubectl get pods -n ingress-nginx
+kubectl get pods -n argocd
+kubectl get pods -n external-secrets
+kubectl get deployment metrics-server -n kube-system
+
+# Metrics API may take up to 60s on first install
+kubectl top nodes
+```
+
+All four components should show running pods. If `kubectl top nodes` fails immediately, wait a minute and retry.
 
 ### Step 2 — Create the pharma AppProject
 
@@ -163,17 +246,143 @@ EOF
 
 ### Step 4 — Set up External Secrets
 
-Wires up AWS Secrets Manager → Kubernetes Secrets (`db-credentials`, `jwt-secret`) in the `dev` namespace via IRSA.
+Wires up AWS Secrets Manager → Kubernetes Secrets (`db-credentials`, `jwt-secret`) in the `dev` namespace via IRSA. The IAM role `pharma-dev-eso-role` is created by Terraform in Stage 1 — no static AWS keys are stored in the cluster.
+
+#### 4.1 — Set variables
 
 ```bash
-./scripts/03-setup-external-secrets.sh
+export ENV=dev
+export AWS_REGION=us-east-1
+export AWS_ACCOUNT_ID=516209541629
+export ESO_ROLE_NAME=pharma-dev-eso-role
+export ESO_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ESO_ROLE_NAME}"
 ```
 
-Prompts for:
-- Environment: `dev`
-- AWS region: `us-east-1`
-- AWS account ID: `516209541629`
-- ESO IAM role name: `pharma-dev-eso-role`
+Secrets will sync from these AWS Secrets Manager paths:
+
+- `/pharma/dev/db-credentials` → Kubernetes Secret `db-credentials`
+- `/pharma/dev/jwt-secret` → Kubernetes Secret `jwt-secret`
+
+#### 4.2 — Create the target namespace
+
+```bash
+kubectl create namespace "$ENV" --dry-run=client -o yaml | kubectl apply -f -
+```
+
+#### 4.3 — Annotate the ESO service account (IRSA)
+
+Tells EKS to inject temporary AWS credentials into External Secrets Operator pods so they can call `secretsmanager:GetSecretValue`.
+
+```bash
+kubectl annotate serviceaccount external-secrets \
+  --namespace external-secrets \
+  "eks.amazonaws.com/role-arn=$ESO_ROLE_ARN" \
+  --overwrite
+
+kubectl rollout restart deployment/external-secrets -n external-secrets
+kubectl rollout status deployment/external-secrets -n external-secrets --timeout=120s
+```
+
+#### 4.4 — Create the ClusterSecretStore
+
+```bash
+kubectl wait --for=condition=established \
+  crd/clustersecretstores.external-secrets.io \
+  crd/externalsecrets.external-secrets.io \
+  --timeout=60s
+
+kubectl apply -f - <<EOF
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ${AWS_REGION}
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+EOF
+```
+
+#### 4.5 — Create ExternalSecrets in the dev namespace
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+  namespace: ${ENV}
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: DB_USERNAME
+      remoteRef:
+        key: /pharma/${ENV}/db-credentials
+        property: username
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: /pharma/${ENV}/db-credentials
+        property: password
+    - secretKey: SPRING_DATASOURCE_USERNAME
+      remoteRef:
+        key: /pharma/${ENV}/db-credentials
+        property: username
+    - secretKey: SPRING_DATASOURCE_PASSWORD
+      remoteRef:
+        key: /pharma/${ENV}/db-credentials
+        property: password
+EOF
+
+kubectl apply -f - <<EOF
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: jwt-secret
+  namespace: ${ENV}
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: jwt-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: JWT_SECRET
+      remoteRef:
+        key: /pharma/${ENV}/jwt-secret
+        property: secret
+EOF
+```
+
+#### 4.6 — Verify secrets synced
+
+```bash
+kubectl get externalsecret -n dev
+kubectl get secret db-credentials jwt-secret -n dev
+```
+
+Both ExternalSecrets should show `Ready` with reason `SecretSynced`. If not, check:
+
+1. Secrets Manager paths exist with the expected JSON keys (`username`/`password` for db, `secret` for jwt)
+2. IAM role `pharma-dev-eso-role` has `secretsmanager:GetSecretValue` on those paths
+3. EKS OIDC provider is configured for IRSA
+
+```bash
+kubectl describe externalsecret db-credentials -n dev
+```
 
 ### Step 5 — Verify
 
