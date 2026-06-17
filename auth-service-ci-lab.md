@@ -35,12 +35,16 @@ GitHub Actions full CI
 | IAM role | `pharma-dev-github-actions-role` (GitHub OIDC — no static keys needed) |
 | RDS PostgreSQL | `<DB_HOST>` — running in the same VPC as EKS |
 | Kubernetes Secrets | `db-credentials` and `jwt-secret` pre-created in the `dev` namespace |
-| ArgoCD | Installed on EKS, app `auth-service-dev` created pointing at `https://github.com/<YOUR-USERNAME>/zen-gitops-lab1.git` |
+| ArgoCD | Installed on EKS, apps `auth-service-dev`, `auth-service-qa`, and `auth-service-prod` created pointing at `https://github.com/<YOUR-USERNAME>/zen-gitops-lab1.git` |
+| Prod RDS PostgreSQL | `<PROD_DB_HOST>` — running in the same VPC as EKS |
+| QA/Prod Kubernetes Secrets | `db-credentials` and `jwt-secret` pre-created in the `qa` and `prod` namespaces |
+| GitHub Actions `production` environment | Pre-configured with required reviewers for the prod approval gate |
 
 Your instructor will give you:
 - `<ACCOUNT_ID>` — 12-digit AWS account number
 - `<DB_HOST>` — RDS endpoint for dev
 - `<QA_DB_HOST>` — RDS endpoint for qa
+- `<PROD_DB_HOST>` — RDS endpoint for prod
 - kubeconfig file for `kubectl` access
 - ArgoCD UI URL and login
 
@@ -423,7 +427,7 @@ Both ExternalSecrets should show `Ready` with reason `SecretSynced`. If not, che
 kubectl describe externalsecret db-credentials -n dev
 ```
 
-### Step 5 — Verify
+### Step 5 — Verify dev
 
 ```bash
 kubectl get applications -n argocd
@@ -431,6 +435,289 @@ kubectl get externalsecret -n dev
 ```
 
 `auth-service-dev` should show `Synced` once a student's first CI build pushes an image and updates `envs/dev/values-auth-service.yaml`.
+
+---
+
+### Step 6 — Create the QA namespace and External Secrets
+
+> **Do this before creating the ArgoCD application.** ArgoCD will sync as soon as the application exists and the gitops values file is present. If the Kubernetes Secrets are not already in the namespace when the first sync fires, Spring Boot cannot connect to the database and the pod enters `CrashLoopBackOff`.
+
+The DB credentials for QA point to the same Secrets Manager path as dev (`/pharma/dev/db-credentials`). QA shares the dev RDS instance — this is intentional and is reflected in the Terraform in the `zen-infra` repo. No separate `/pharma/qa/...` secret paths exist.
+
+```bash
+export AWS_REGION=us-east-1
+export AWS_ACCOUNT_ID=516209541629
+
+kubectl create namespace qa --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f - <<'EOF'
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+  namespace: qa
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: DB_USERNAME
+      remoteRef:
+        key: /pharma/dev/db-credentials
+        property: username
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: /pharma/dev/db-credentials
+        property: password
+    - secretKey: SPRING_DATASOURCE_USERNAME
+      remoteRef:
+        key: /pharma/dev/db-credentials
+        property: username
+    - secretKey: SPRING_DATASOURCE_PASSWORD
+      remoteRef:
+        key: /pharma/dev/db-credentials
+        property: password
+EOF
+
+kubectl apply -f - <<'EOF'
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: jwt-secret
+  namespace: qa
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: jwt-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: JWT_SECRET
+      remoteRef:
+        key: /pharma/dev/jwt-secret
+        property: secret
+EOF
+```
+
+Wait for both External Secrets to report `SecretSynced` before proceeding:
+
+```bash
+kubectl get externalsecret -n qa
+# NAME             STORE                REFRESH INTERVAL   STATUS   READY
+# db-credentials   aws-secrets-manager  1h                 Ready    True
+# jwt-secret       aws-secrets-manager  1h                 Ready    True
+
+kubectl get secret db-credentials jwt-secret -n qa
+```
+
+Both Kubernetes Secrets must exist before you create the ArgoCD application. If an ExternalSecret shows `SecretSyncError`, check:
+
+1. The `/pharma/dev/db-credentials` and `/pharma/dev/jwt-secret` paths exist in AWS Secrets Manager (created by Terraform in `zen-infra`)
+2. IAM role `pharma-dev-eso-role` has `secretsmanager:GetSecretValue` on those paths
+3. The ESO service account annotation is correct: `kubectl get sa external-secrets -n external-secrets -o yaml | grep role-arn`
+
+### Step 7 — Create the auth-service-qa ArgoCD Application
+
+Only run this after Step 6 confirms both secrets are `Ready`.
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: auth-service-qa
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: pharma
+  source:
+    repoURL: https://github.com/DPP-2026/zen-gitops-lab1.git
+    targetRevision: HEAD
+    path: helm-charts
+    helm:
+      valueFiles:
+        - ../envs/qa/values-auth-service.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: qa
+  syncPolicy:
+    automated:
+      prune: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+EOF
+```
+
+ArgoCD will attempt an initial sync immediately. Because the QA values file already exists in `zen-gitops-lab1` (committed by the student in Part 3), the app will start syncing at once. The pod will start successfully because `db-credentials` and `jwt-secret` are already present in the `qa` namespace.
+
+### Step 8 — Create the prod namespace and External Secrets
+
+> Same principle as QA: secrets must exist before the ArgoCD application is created. For prod, the ArgoCD app uses manual sync, so there is no risk of an immediate uncontrolled deploy — but the namespace and secrets still need to be ready before the student runs `argocd app sync` in Part 10.
+
+Prod has its own RDS instance provisioned by Terraform in `zen-infra`. Its Secrets Manager paths (`/pharma/prod/db-credentials`, `/pharma/prod/jwt-secret`) are separate from dev/qa.
+
+```bash
+export AWS_REGION=us-east-1
+export AWS_ACCOUNT_ID=516209541629
+
+kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f - <<'EOF'
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+  namespace: prod
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: DB_USERNAME
+      remoteRef:
+        key: /pharma/prod/db-credentials
+        property: username
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: /pharma/prod/db-credentials
+        property: password
+    - secretKey: SPRING_DATASOURCE_USERNAME
+      remoteRef:
+        key: /pharma/prod/db-credentials
+        property: username
+    - secretKey: SPRING_DATASOURCE_PASSWORD
+      remoteRef:
+        key: /pharma/prod/db-credentials
+        property: password
+EOF
+
+kubectl apply -f - <<'EOF'
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: jwt-secret
+  namespace: prod
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: jwt-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: JWT_SECRET
+      remoteRef:
+        key: /pharma/prod/jwt-secret
+        property: secret
+EOF
+
+kubectl get externalsecret -n prod
+kubectl get secret db-credentials jwt-secret -n prod
+```
+
+Both Kubernetes Secrets must be `Ready` before the student reaches Part 10.
+
+### Step 9 — Create the auth-service-prod ArgoCD Application
+
+Prod uses **manual sync** — ArgoCD detects drift but will not auto-apply. A human must approve via the CLI or UI before any change lands in production.
+
+Add the `prod` namespace to the AppProject destinations first:
+
+```bash
+kubectl patch appproject pharma -n argocd --type=json \
+  -p='[{"op":"add","path":"/spec/destinations/-","value":{"server":"https://kubernetes.default.svc","namespace":"prod"}}]'
+```
+
+Then create the application:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: auth-service-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: pharma
+  source:
+    repoURL: https://github.com/DPP-2026/zen-gitops-lab1.git
+    targetRevision: HEAD
+    path: helm-charts
+    helm:
+      valueFiles:
+        - ../envs/prod/values-auth-service.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+EOF
+```
+
+Note: no `automated:` block — prod never syncs without an explicit `argocd app sync auth-service-prod`.
+
+### Step 10 — Configure the GitHub Actions `production` environment
+
+The `promote-prod.yml` workflow requires a GitHub environment named `production` with required reviewers. This creates the manual approval gate in CI.
+
+In each student's `zen-pharma-backend-lab1` fork (or in the upstream template repo):
+
+1. Go to **Settings** → **Environments** → **New environment**
+2. Name: `production`, click **Configure environment**
+3. Enable **Required reviewers** — add yourself (instructor) or a teaching assistant
+4. Enable **Prevent self-review** so students cannot approve their own production deployments
+5. Click **Save protection rules**
+
+Verify by navigating to **Settings** → **Environments** → `production` and confirming the reviewer list.
+
+### Step 11 — Verify all ArgoCD applications
+
+```bash
+kubectl get applications -n argocd
+```
+
+Expected output:
+
+```
+NAME               SYNC STATUS   HEALTH STATUS
+auth-service-dev   Synced        Healthy
+auth-service-qa    OutOfSync     Missing
+auth-service-prod  OutOfSync     Missing
+```
+
+QA and Prod show `OutOfSync / Missing` until students push their values files and trigger their first CI run. That is expected.
 
 ---
 
@@ -804,6 +1091,237 @@ Within 3 minutes, replicas go from `3` → `1` (what the values file says).
 
 ---
 
+## Part 7 — Promote to QA
+
+The QA promotion PR was opened automatically by Job 3 in Part 4. Before merging it, confirm the QA secrets are already in the cluster — ArgoCD will fire a sync the moment the merge lands, and if the secrets are missing the pod will enter `CrashLoopBackOff`.
+
+### Step 7.1 — Confirm QA External Secrets are ready
+
+```bash
+kubectl get externalsecret -n qa
+```
+
+Both rows must show `READY = True` and `STATUS = SecretSynced`:
+
+```
+NAME             STORE                REFRESH INTERVAL   STATUS         READY
+db-credentials   aws-secrets-manager  1h                 SecretSynced   True
+jwt-secret       aws-secrets-manager  1h                 SecretSynced   True
+```
+
+```bash
+kubectl get secret db-credentials jwt-secret -n qa
+```
+
+If either secret is missing, stop and notify your instructor. Do not merge the PR until both secrets exist. The instructor must run the External Secrets setup in Step 6 of the Instructor Cluster Setup section.
+
+### Step 7.2 — Merge the QA promotion PR
+
+1. Open your `zen-gitops-lab1` fork on GitHub
+2. Navigate to **Pull requests**
+3. Open the PR titled `promote(qa): auth-service → sha-xxxxxxx`
+4. Click **Merge pull request** → **Confirm merge**
+
+ArgoCD polls the `main` branch every ~3 minutes and will detect the merge automatically.
+
+### Step 7.3 — Watch ArgoCD sync QA
+
+```bash
+argocd app get auth-service-qa
+```
+
+The sync status should move from `OutOfSync` → `Syncing` → `Synced / Healthy`.
+
+```bash
+kubectl get pods -n qa -w
+```
+
+Expected output:
+
+```
+NAME                           READY   STATUS              RESTARTS   AGE
+auth-service-7d9f8c-xxxx       0/1     ContainerCreating   0          5s
+auth-service-7d9f8c-xxxx       0/1     Running             0          20s
+auth-service-7d9f8c-xxxx       1/1     Running             0          55s
+```
+
+Press **Ctrl+C** to exit the watch.
+
+### Step 7.4 — Confirm the QA image
+
+```bash
+kubectl get pods -n qa -l app.kubernetes.io/name=auth-service \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+```
+
+Expected: `<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/auth-service:sha-xxxxxxx`
+
+### Step 7.5 — Hit the QA health endpoint
+
+```bash
+kubectl port-forward -n qa deploy/auth-service 8082:8081 &
+curl http://localhost:8082/actuator/health
+kill %1
+```
+
+Expected: `{"status":"UP"}`
+
+---
+
+## Part 8 — Set up the Prod CD pipeline
+
+### Step 8.1 — Add the prod values file to your gitops repo
+
+In your `zen-gitops-lab1` fork, open `envs/prod/values-auth-service.yaml` and replace:
+
+- `<ACCOUNT_ID>` → your 12-digit AWS account ID
+- `<PROD_DB_HOST>` → the RDS prod endpoint from your instructor
+
+```bash
+cd zen-gitops-lab1
+git add envs/prod/values-auth-service.yaml
+git commit -m "feat(auth-service): add prod values file"
+git push origin main
+```
+
+### Step 8.2 — Create the `production` GitHub Actions environment
+
+The `promote-prod.yml` workflow uses a GitHub environment called `production`. You need to create it in your `zen-pharma-backend-lab1` fork with a required reviewer — this is the manual approval gate before any prod deployment.
+
+1. Go to your `zen-pharma-backend-lab1` fork → **Settings** → **Environments** → **New environment**
+2. Name: `production`, click **Configure environment**
+3. Enable **Required reviewers** — add a classmate, your instructor, or a teaching assistant
+4. Click **Save protection rules**
+
+The prod promotion job will now pause and notify your reviewer before it writes to the gitops repo.
+
+### Step 8.3 — Confirm the `promote-prod.yml` workflow is present
+
+```bash
+cd zen-pharma-backend-lab1
+cat .github/workflows/promote-prod.yml
+```
+
+This workflow triggers on a merge to `main`, verifies the image tag exists in ECR, waits for the `production` environment approval, then commits the new tag to `envs/prod/values-auth-service.yaml` in your gitops repo.
+
+---
+
+## Part 9 — Trigger and approve a prod promotion
+
+### Step 9.1 — Merge develop into main
+
+```bash
+cd zen-pharma-backend-lab1
+git checkout main
+git merge develop --no-ff -m "release: promote auth-service to prod"
+git push origin main
+```
+
+Go to **Actions** → **Promote to Prod**. The workflow will:
+
+1. Verify the image tag (`sha-xxxxxxx`) exists in ECR
+2. Pause at the `production` environment gate — a yellow **Review deployments** banner appears
+
+### Step 9.2 — Approve the deployment
+
+The reviewer you added in Step 8.2 must:
+
+1. Click on the running **Promote to Prod** workflow run
+2. Click **Review deployments**
+3. Select the `production` environment checkbox
+4. Click **Approve and deploy**
+
+Once approved, the workflow completes:
+
+```
+✓ Checkout zen-gitops-lab1
+✓ Update envs/prod/values-auth-service.yaml  →  sha-xxxxxxx
+✓ Commit: ci(prod): update auth-service → sha-xxxxxxx
+✓ Push to zen-gitops-lab1 main
+```
+
+### Step 9.3 — Review the diff before syncing prod
+
+Prod is configured with manual sync. ArgoCD detects the gitops change but waits for your explicit command.
+
+```bash
+argocd app get auth-service-prod
+# Sync Status:   OutOfSync
+# Health Status: Missing  (no pod yet)
+```
+
+Inspect exactly what will be applied before you commit:
+
+```bash
+argocd app diff auth-service-prod
+```
+
+### Step 9.4 — Sync prod
+
+```bash
+argocd app sync auth-service-prod --prune
+```
+
+Watch it complete:
+
+```bash
+argocd app wait auth-service-prod --health --timeout 300
+```
+
+---
+
+## Part 10 — Verify Prod and understand manual sync
+
+### Step 10.1 — Check the prod pod
+
+```bash
+kubectl get pods -n prod -w
+```
+
+Wait for `1/1 Running`, then press **Ctrl+C**.
+
+### Step 10.2 — Confirm the prod image
+
+```bash
+kubectl get pods -n prod -l app.kubernetes.io/name=auth-service \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+```
+
+Expected: `<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/auth-service:sha-xxxxxxx`
+
+### Step 10.3 — Hit the prod health endpoint
+
+```bash
+kubectl port-forward -n prod deploy/auth-service 8083:8081 &
+curl http://localhost:8083/actuator/health
+kill %1
+```
+
+Expected: `{"status":"UP"}`
+
+### Step 10.4 — Verify prod does NOT self-heal
+
+Unlike DEV, `auth-service-prod` has no `automated:` policy. Manual changes persist until you explicitly sync.
+
+```bash
+kubectl scale deployment auth-service -n prod --replicas=3
+
+# ArgoCD shows OutOfSync but does not revert automatically
+argocd app get auth-service-prod
+# Sync Status:   OutOfSync
+# Health Status: Healthy  (3 replicas are healthy)
+```
+
+This is intentional for production: an on-call engineer can scale up instantly in an incident without waiting for git. When the incident is resolved, reconcile with git and sync:
+
+```bash
+argocd app sync auth-service-prod --prune
+```
+
+**The key difference from DEV:** DEV self-heals — no manual changes survive. Prod does not self-heal — humans decide when to sync, giving time to validate or roll back a change before it goes live.
+
+---
+
 ## Complete flow — what you just built
 
 ```
@@ -811,29 +1329,52 @@ your laptop
     │
     │  git push → develop
     ▼
-GitHub Actions full CI
+GitHub Actions full CI  (ci-auth-service.yml)
     mvn verify → CodeQL → Semgrep
     Docker build → Trivy scan
     ECR push → sha-abc1234
     Cosign sign → Rekor log
     │
-    ├──► zen-gitops-lab1: envs/dev/values-auth-service.yaml
-    │         image.tag: sha-abc1234
+    ├──► deploy-dev job
+    │         zen-gitops-lab1: envs/dev/values-auth-service.yaml
     │              │
     │              ▼
-    │         ArgoCD auto-sync DEV
+    │         ArgoCD auto-sync DEV  (selfHeal=true)
     │         helm template → kubectl apply
     │         DEV pod: sha-abc1234 ✓
     │
-    └──► zen-gitops-lab1 PR: envs/qa/values-auth-service.yaml
-              (merge when QA team approves)
-                   │
-                   ▼
-              ArgoCD auto-sync QA
-              same image, new namespace ✓
+    └──► open-qa-pr job
+              zen-gitops-lab1 PR: envs/qa/values-auth-service.yaml
+              │
+              │  (QA team reviews and merges PR)
+              ▼
+         ArgoCD auto-sync QA  (automated, no selfHeal)
+         same image → qa namespace ✓
+
+    │  git merge develop → main
+    ▼
+GitHub Actions  (promote-prod.yml)
+    Verify sha-abc1234 exists in ECR
+    │
+    │  ⏸  production environment gate
+    │     reviewer clicks Approve and deploy
+    │
+    ▼
+    zen-gitops-lab1: envs/prod/values-auth-service.yaml
+         │
+         │  (operator reviews diff, runs argocd app sync)
+         ▼
+    ArgoCD MANUAL sync PROD  (no automated, no selfHeal)
+    same image → prod namespace ✓
 ```
 
 CI never talks to Kubernetes. CI talks to git. Kubernetes gets its orders from git.
+
+| Environment | ArgoCD sync | Self-heal | Gate |
+|---|---|---|---|
+| dev | Automated | Yes — reverts manual changes | None (any develop push) |
+| qa | Automated | No | GitOps PR review and merge |
+| prod | Manual | No | GitHub environment approval + explicit `argocd app sync` |
 
 ---
 
@@ -850,3 +1391,11 @@ CI never talks to Kubernetes. CI talks to git. Kubernetes gets its orders from g
 | ArgoCD shows `OutOfSync` but not healing | `selfHeal` not enabled | Run `argocd app set auth-service-dev --self-heal` |
 | ArgoCD app still pointing at `DPP-2026/zen-gitops-lab1` | App repoURL not updated to your fork | Notify instructor — the app needs to be re-pointed to `https://github.com/<YOUR-USERNAME>/zen-gitops-lab1.git` |
 | `argocd: command not found` | argocd CLI not installed | `brew install argocd` (Mac) or see https://argo-cd.readthedocs.io/en/stable/cli_installation/ |
+| QA pod stuck in `CrashLoopBackOff` | Spring Boot cannot connect to QA RDS | `kubectl logs -n qa deploy/auth-service` — check `DB_HOST` in `envs/qa/values-auth-service.yaml` |
+| `auth-service-qa` stays `OutOfSync` after merging QA PR | ArgoCD app repoURL still points at DPP-2026 org | Notify instructor — the QA app needs to point at your fork |
+| `Promote to Prod` workflow skips the approval gate | `production` environment not configured in your fork | Create the environment under **Settings → Environments** and add a required reviewer (Part 8.2) |
+| `Promote to Prod` workflow fails: `image not found in ECR` | The develop CI run did not complete successfully | Check the `ci-auth-service.yml` run on your develop branch; the image must exist before prod promotion |
+| `argocd app sync auth-service-prod` hangs | Prod pod cannot pull the image or connect to RDS | `kubectl describe pod -n prod` and `kubectl logs -n prod deploy/auth-service` to identify the failure |
+| Prod pod stuck in `CrashLoopBackOff` | Spring Boot cannot connect to prod RDS | Check `<PROD_DB_HOST>` in `envs/prod/values-auth-service.yaml` and confirm the RDS security group allows EKS nodes |
+| QA External Secrets show `SecretSyncError` | Dev Secrets Manager paths not reachable from ESO | Confirm `/pharma/dev/db-credentials` and `/pharma/dev/jwt-secret` exist in AWS Secrets Manager (created by Terraform in `zen-infra`) and that `pharma-dev-eso-role` has `GetSecretValue` on those paths |
+| Prod External Secrets show `SecretSyncError` | Prod Secrets Manager paths not created | Confirm `/pharma/prod/db-credentials` and `/pharma/prod/jwt-secret` exist in AWS Secrets Manager (created by Terraform in `zen-infra`) |
