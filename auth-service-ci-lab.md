@@ -287,6 +287,15 @@ EOF
 
 Wires up AWS Secrets Manager → Kubernetes Secrets (`db-credentials`, `jwt-secret`) in the `dev` namespace via IRSA. The IAM role `pharma-dev-eso-role` is created by Terraform in Stage 1 — no static AWS keys are stored in the cluster.
 
+**Why External Secrets Operator instead of native Kubernetes Secrets:**
+
+- **Single source of truth** — the real secret value lives in AWS Secrets Manager, not in the cluster or in git. Kubernetes Secrets alone have no upstream source; whoever last ran `kubectl apply` (or whatever's checked into git) is the source of truth, which invites drift and stale values.
+- **No static credentials in the cluster** — ESO authenticates to AWS via IRSA (the `pharma-dev-eso-role` IAM role), so no long-lived AWS access keys are stored as Kubernetes Secrets or env vars. Native Kubernetes Secrets have no equivalent mechanism for pulling from an external provider.
+- **Automatic rotation** — ESO re-fetches from AWS Secrets Manager on a `refreshInterval` (1h in this lab) and updates the Kubernetes Secret in place. Rotate the value in Secrets Manager and it propagates without a manual `kubectl apply` or a redeploy.
+- **Centralized audit trail** — every read of a secret value goes through AWS Secrets Manager, which is logged in CloudTrail. Kubernetes Secrets are only base64-encoded and give no equivalent access log for who read what, when.
+- **Consistent across environments** — dev, qa, and prod all sync from the same AWS Secrets Manager paths through the same ClusterSecretStore mechanism, so promoting a change is a Secrets Manager update, not a per-namespace `kubectl` command.
+- **Kubernetes-native consumption stays the same** — Pods still mount the result as an ordinary Kubernetes Secret, so no application code changes; ESO only replaces how that Secret's contents get populated and kept fresh.
+
 #### 4.1 — Set variables
 
 ```bash
