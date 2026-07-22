@@ -195,6 +195,8 @@ spec:
       namespace: dev
     - server: https://kubernetes.default.svc
       namespace: qa
+    - server: https://kubernetes.default.svc
+      namespace: prod
   clusterResourceWhitelist:
     - group: "*"
       kind: "*"
@@ -647,14 +649,7 @@ Both Kubernetes Secrets must be `Ready` before the student reaches Part 10.
 
 Prod uses **manual sync** — ArgoCD detects drift but will not auto-apply. A human must approve via the CLI or UI before any change lands in production.
 
-Add the `prod` namespace to the AppProject destinations first:
-
-```bash
-kubectl patch appproject pharma -n argocd --type=json \
-  -p='[{"op":"add","path":"/spec/destinations/-","value":{"server":"https://kubernetes.default.svc","namespace":"prod"}}]'
-```
-
-Then create the application:
+The `prod` namespace is already in the AppProject destinations (Step 2), so create the application directly:
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -1396,7 +1391,7 @@ CI never talks to Kubernetes. CI talks to git. Kubernetes gets its orders from g
 | ArgoCD shows `OutOfSync` but not healing | `selfHeal` not enabled | Run `argocd app set auth-service-dev --self-heal` |
 | ArgoCD app still pointing at `DPP-2026/zen-gitops-lab1` | App repoURL not updated to your fork | Notify instructor — the app needs to be re-pointed to `https://github.com/<YOUR-USERNAME>/zen-gitops-lab1.git` |
 | `argocd: command not found` | argocd CLI not installed | `brew install argocd` (Mac) or see https://argo-cd.readthedocs.io/en/stable/cli_installation/ |
-| QA pod stuck in `CrashLoopBackOff` | Wrong `DB_HOST` in QA values file | `kubectl logs -n qa deploy/auth-service` — confirm `DB_HOST` in `envs/qa/values-auth-service.yaml` matches the dev RDS endpoint (all environments share the same DB) |
+| QA pod stuck in `CrashLoopBackOff` | Wrong `DB_HOST` in QA values file | `kubectl logs -n qa deploy/auth-service` — confirm `DB_HOST` in `envs/qa/values-auth-service.yaml` matches the dev RDS endpoint (all environments share the same DB). If it's stale, fix it: `cd zen-gitops-lab1 && yq e '.configmap.DB_HOST = "<CURRENT_DEV_RDS_ENDPOINT>"' -i envs/qa/values-auth-service.yaml && git add envs/qa/values-auth-service.yaml && git commit -m "fix(auth-service): correct QA DB_HOST" && git push origin main` — ArgoCD auto-syncs QA within ~3 minutes, or force it with `argocd app sync auth-service-qa` |
 | `auth-service-qa` stays `OutOfSync` after merging QA PR | ArgoCD app repoURL still points at DPP-2026 org | Notify instructor — the QA app needs to point at your fork |
 | `Promote to Prod` workflow skips the approval gate | `production` environment not configured in your fork | Create the environment under **Settings → Environments** and add a required reviewer (Part 8.2) |
 | `Promote to Prod` workflow fails: `image not found in ECR` | The develop CI run did not complete successfully | Check the `ci-auth-service.yml` run on your develop branch; the image must exist before prod promotion |
